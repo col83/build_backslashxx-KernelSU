@@ -1,0 +1,123 @@
+name: Build Manager
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-key:
+    runs-on: ubuntu-26.04
+    outputs:
+      expected_size: ${{ steps.extract.outputs.expected_size }}
+      expected_hash: ${{ steps.extract.outputs.expected_hash }}
+      keystore: ${{ steps.gen.outputs.keystore }}
+      keystore_password: ${{ steps.gen.outputs.keystore_password }}
+      key_password: ${{ steps.gen.outputs.key_password }}
+    steps:
+      - name: Generate temporary keystore
+        if: github.event_name == 'pull_request'
+        id: gen
+        run: |
+          KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+          KEY_PASSWORD=$(openssl rand -hex 32)
+          echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+          echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+
+          keytool -genkeypair \
+            -alias pr-key \
+            -keyalg RSA -keysize 2048 \
+            -validity 1 \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -dname "CN=KernelSU PR Build" \
+            -storetype JKS \
+            -keystore pr-key.jks
+
+          echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+
+      - name: Extract certificate hash and size
+        if: github.event_name == 'pull_request'
+        id: extract
+        env:
+          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+        run: |
+          # Export DER certificate
+          keytool -exportcert \
+            -alias pr-key \
+            -keystore pr-key.jks \
+            -storepass "$STORE_PASS" \
+            -file pr-cert.der
+
+          # Calculate size in hex
+          SIZE_DEC=$(stat -c%s pr-cert.der)
+          SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
+          echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
+
+          # Calculate SHA256 hash
+          HASH=$(sha256sum pr-cert.der | awk '{print $1}')
+          echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
+
+          echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
+          echo "Certificate hash: $HASH"
+
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-ksud:
+    needs: [build-ksuinit]
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            pack_ksuinit: true
+          - target: armv7-linux-androideabi
+            pack_ksuinit: false
+          - target: x86_64-linux-android
+            pack_ksuinit: false
+
+    uses: ./.github/workflows/build_ksud.yml
+    with:
+      target: ${{ matrix.target }}
+      pack_ksuinit: ${{ matrix.pack_ksuinit }}
+
+  build-manager:
+    needs: [generate-key, build-ksuinit, build-ksud]
+    if: always() && needs.generate-key.result == 'success' && needs.build-ksuinit.result == 'success' && needs.build-ksud == 'success'
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: ./KernelSU/manager
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Write signing config
+        run: |
+          {
+            echo KEYSTORE_PASSWORD='password'
+            echo KEY_ALIAS='alias'
+            echo KEY_PASSWORD='password'
+            echo KEYSTORE_FILE='dummy.keystore'
+          } >> gradle.properties
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Manager
+        run: ./gradlew clean assembleRelease --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: KernelSU/manager/app/build/outputs/apk/release/*.apk
+          archive: false
+          compression-level: 0

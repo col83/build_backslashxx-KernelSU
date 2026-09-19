@@ -1,0 +1,89 @@
+name: Build ksud
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+
+      pack_ksuinit:
+        required: false
+        type: boolean
+        default: false
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target architecture
+        required: true
+        type: choice
+        options:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+
+      pack_ksuinit:
+        description: Pack ksuinit
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-ksud:
+    name: ksud - ${{ inputs.target }}
+
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add "${{ inputs.target }}"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: KernelSU/userspace/ksud
+          cache-targets: false
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksud
+        working-directory: ./KernelSU
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/workflows/scripts/setup-rust-build.sh \
+            "${{ inputs.target }}" \
+            26
+
+          cargo build \
+            --target "${{ inputs.target }}" \
+            --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+
+      - name: Prepare ksud artifact
+        working-directory: ./KernelSU
+        run: |
+          cp \
+            "target/${{ inputs.target }}/release/ksud" \
+            "target/${{ inputs.target }}/release/ksud-${{ inputs.target }}"
+
+      - name: Upload ksud artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ inputs.target }}
+          path: KernelSU/target/${{ inputs.target }}/release/ksud-${{ inputs.target }}
+          archive: false
+          compression-level: 0
